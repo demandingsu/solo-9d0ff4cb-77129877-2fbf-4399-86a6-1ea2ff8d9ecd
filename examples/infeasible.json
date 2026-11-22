@@ -1,0 +1,10 @@
+{
+  "batch_id": "nightly-2026-11-22-bad",
+  "limits": {
+    "s1": {"max_rows": 20000, "max_pairs": 300000}
+  },
+  "keys": [
+    {"key": "dev-7|camp-2", "impressions": 12000, "clicks": 0, "shard": "s1"},
+    {"key": "dev-8|camp-4", "impressions": 9000, "clicks": 0, "shard": "s1"}
+  ]
+}

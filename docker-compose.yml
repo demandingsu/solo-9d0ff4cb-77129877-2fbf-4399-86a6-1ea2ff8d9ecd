@@ -1,0 +1,30 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      PLAN_DB: /data/plans.db
+    volumes:
+      - plan-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # One-shot test runner: docker compose --profile test run --rm tests
+  tests:
+    build: .
+    profiles: ["test"]
+    command: ["python", "-m", "pytest", "tests/", "-q"]
+    environment:
+      PLAN_DB: /tmp/plans-test.db
+
+volumes:
+  plan-data:
