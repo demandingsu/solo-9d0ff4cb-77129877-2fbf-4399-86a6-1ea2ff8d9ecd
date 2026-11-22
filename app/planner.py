@@ -42,6 +42,25 @@ otherwise :class:`InfeasiblePlan` is raised and nothing is published.
 
 The whole algorithm is deterministic: identical input always yields an
 identical plan, and every rule is reproducible from row numbers alone.
+
+Trial placement complexity
+--------------------------
+For a fixed bucket count ``B`` the near-even split has only two distinct
+bucket sizes: ``rem = M mod B`` buckets of size ``base + 1`` followed by
+``B - rem`` buckets of size ``base`` (see :func:`split_sizes`).  First-fit
+placement of identical buckets can therefore be solved per shard in closed
+form: one shard takes ``min(buckets left, rows_left // need_rows,
+pairs_left // need_pairs)`` buckets before the scan moves on.  A trial is
+two such phases (large buckets, then small ones), so both the number of
+capacity computations and the number of temporary records are bounded by
+the shard count and never grow with the bucket count.
+
+A trial mutates only a local snapshot of the shards' remaining capacity;
+the committed shard state is touched solely on success, so failed trials
+consume no margin and later hot keys are always tried against the capacity
+left after the buckets already placed for earlier keys.  Per-bucket detail
+(the row ranges and landing shard of every bucket) is expanded only after
+the whole batch passes the final capacity gate.
 """
 
 from __future__ import annotations
@@ -106,6 +125,28 @@ class _ShardState:
         return self.limit.max_pairs - self.pairs_used
 
 
+@dataclass(frozen=True)
+class _Placement:
+    """Compact record of one salted key's committed placement.
+
+    ``landed`` lists, in shard preference order, ``(shard, big, small)``:
+    how many large (``base + 1`` rows) and small (``base`` rows) buckets the
+    shard hosts.  Its size is bounded by the shard count, independent of the
+    bucket count.  Per-bucket detail is rebuilt from it by
+    :func:`_expand_placement` only once the whole batch is feasible.
+    """
+
+    m: int
+    M: int
+    base: int
+    rem: int
+    landed: tuple[tuple[str, int, int], ...]
+
+    @property
+    def bucket_count(self) -> int:
+        return sum(big + small for _, big, small in self.landed)
+
+
 def build_plan(
     keys: list[KeyLoad],
     limits: dict[str, ShardLimit],
@@ -152,7 +193,9 @@ def build_plan(
 
     # Deterministic processing order: biggest join output first.
     hot.sort(key=lambda k: (-k.pairs, -k.rows, k.key))
-    splits = [_place_hot_key(k, states) for k in hot]
+    # Compact trial placement: each call commits only bucket counts per
+    # shard, never per-bucket detail, and failed trials leave no trace.
+    placements = [_place_hot_key(k, states) for k in hot]
 
     # --- final gate: publish only if every shard meets its targets --------
     loads = []
@@ -180,11 +223,86 @@ def build_plan(
                 "within_limits": within,
             }
         )
+
+    # The whole batch is feasible: only now expand per-bucket detail.
+    splits = [_expand_placement(k, p) for k, p in zip(hot, placements)]
     return {"splits": splits, "shard_loads": loads}
 
 
-def _place_hot_key(k: KeyLoad, states: dict[str, _ShardState]) -> dict:
-    """Salt one hot key: pick bucket count, split ranges, land buckets."""
+def _fill_phase(
+    need_rows: int,
+    need_pairs: int,
+    count: int,
+    remaining: dict[str, list[int]],
+    preference: list[str],
+) -> dict[str, int] | None:
+    """First-fit ``count`` identical buckets onto shards in preference order.
+
+    Buckets are identical, so each shard takes as many as fit in one closed
+    form (``capacity // need``) before the scan moves to the next shard --
+    the exact shard sequence a bucket-by-bucket first-fit would produce, in
+    O(shard count) steps.  Mutates the local ``remaining`` snapshot only and
+    returns ``{shard: buckets taken}``, or ``None`` when the shards cannot
+    host all ``count`` buckets.
+    """
+    if count == 0:
+        return {}
+    taken: dict[str, int] = {}
+    placed = 0
+    for shard in preference:
+        rows_left, pairs_left = remaining[shard]
+        capacity = rows_left // need_rows
+        if need_pairs > 0:
+            capacity = min(capacity, pairs_left // need_pairs)
+        if capacity <= 0:
+            continue
+        n = min(count - placed, capacity)
+        remaining[shard] = [
+            rows_left - n * need_rows,
+            pairs_left - n * need_pairs,
+        ]
+        taken[shard] = n
+        placed += n
+        if placed == count:
+            return taken
+    return None
+
+
+def _try_place(
+    m: int,
+    M: int,
+    buckets: int,
+    states: dict[str, _ShardState],
+    preference: list[str],
+) -> tuple[dict[str, int], dict[str, int], dict[str, list[int]]] | None:
+    """One first-fit trial at bucket count ``buckets`` on remaining capacity.
+
+    Runs in O(shard count) time with O(shard count) temporary records,
+    independent of ``buckets``.  Returns the per-shard large/small bucket
+    counts and the remaining-capacity snapshot, or ``None`` on failure.
+    The snapshot is local: a failed trial changes no committed state.
+    """
+    base, rem = divmod(M, buckets)
+    remaining = {
+        shard: [st.rows_left, st.pairs_left] for shard, st in states.items()
+    }
+    # Large buckets (size base + 1) come first in split_sizes order, so the
+    # first-fit scan must host them before any small (size base) bucket.
+    big = _fill_phase(
+        base + 1 + m, (base + 1) * m, rem, remaining, preference
+    )
+    if big is None:
+        return None
+    small = _fill_phase(
+        base + m, base * m, buckets - rem, remaining, preference
+    )
+    if small is None:
+        return None
+    return big, small, remaining
+
+
+def _place_hot_key(k: KeyLoad, states: dict[str, _ShardState]) -> _Placement:
+    """Salt one hot key: pick bucket count, trial-place, commit compactly."""
     orig = states[k.shard]
     max_rows, max_pairs = orig.limit.max_rows, orig.limit.max_pairs
 
@@ -214,41 +332,38 @@ def _place_hot_key(k: KeyLoad, states: dict[str, _ShardState]) -> dict:
     preference = [k.shard] + sorted(s for s in states if s != k.shard)
 
     while True:
-        sizes = split_sizes(M, buckets)
-        # Simulate placement on remaining capacity; commit only on success.
-        sim = {s: [st.rows_left, st.pairs_left] for s, st in states.items()}
-        assignment: list[str] | None = []
-        for size in sizes:
-            need_rows, need_pairs = size + m, size * m
-            target = next(
-                (
-                    s
-                    for s in preference
-                    if sim[s][0] >= need_rows and sim[s][1] >= need_pairs
-                ),
-                None,
-            )
-            if target is None:
-                assignment = None
-                break
-            sim[target][0] -= need_rows
-            sim[target][1] -= need_pairs
-            assignment.append(target)
-
-        if assignment is not None:
-            for shard, st in states.items():
-                st.rows_used = st.limit.max_rows - sim[shard][0]
-                st.pairs_used = st.limit.max_pairs - sim[shard][1]
-            break
+        trial = _try_place(m, M, buckets, states, preference)
+        if trial is not None:
+            big, small, remaining = trial
+            # Commit: derive used load from the trial's remaining snapshot and
+            # count hosted buckets.  Nothing is committed on a failed trial.
+            landed: list[tuple[str, int, int]] = []
+            for shard in preference:
+                n_big = big.get(shard, 0)
+                n_small = small.get(shard, 0)
+                if n_big == 0 and n_small == 0:
+                    continue
+                st = states[shard]
+                rows_left, pairs_left = remaining[shard]
+                st.rows_used = st.limit.max_rows - rows_left
+                st.pairs_used = st.limit.max_pairs - pairs_left
+                st.hosted_buckets += n_big + n_small
+                landed.append((shard, n_big, n_small))
+            return _Placement(m, M, *divmod(M, buckets), tuple(landed))
 
         # Smallest bucket count that would fit some shard's remaining capacity.
         nxt: int | None = None
         for st in states.values():
             rows_left, pairs_left = st.rows_left, st.pairs_left
             if m < rows_left and m <= pairs_left:
-                need = max(
-                    ceil_div(M, rows_left - m), ceil_div(M * m, pairs_left), 1
-                )
+                if M * m == 0:
+                    need = max(ceil_div(M, rows_left - m), 1)
+                else:
+                    need = max(
+                        ceil_div(M, rows_left - m),
+                        ceil_div(M * m, pairs_left),
+                        1,
+                    )
                 if need > buckets and (nxt is None or need < nxt):
                     nxt = need
         if nxt is None:
@@ -260,10 +375,32 @@ def _place_hot_key(k: KeyLoad, states: dict[str, _ShardState]) -> dict:
             )
         buckets = nxt
 
+
+def _expand_placement(k: KeyLoad, placement: _Placement) -> dict:
+    """Rebuild the full per-bucket rule for one committed salted key.
+
+    The shard sequence is the one first-fit produced: all large buckets in
+    preference order, then all small buckets in preference order.  Row
+    ranges follow :func:`split_sizes`, so bucket numbers, landing shards and
+    row-number segments are identical to a bucket-by-bucket placement.
+    """
+    # Replicate the smaller side; ties replicate clicks (deterministic).
+    if k.impressions >= k.clicks:
+        replicated_side, partitioned_side = "clicks", "impressions"
+    else:
+        replicated_side, partitioned_side = "impressions", "clicks"
+
+    m = placement.m
+    base, rem = placement.base, placement.rem
+    sequence: list[tuple[str, int]] = []
+    for shard, n_big, _ in placement.landed:
+        sequence.extend((shard, base + 1) for _ in range(n_big))
+    for shard, _, n_small in placement.landed:
+        sequence.extend((shard, base) for _ in range(n_small))
+
     out_buckets = []
     start = 1
-    for idx, (size, shard) in enumerate(zip(sizes, assignment)):
-        states[shard].hosted_buckets += 1
+    for idx, (shard, size) in enumerate(sequence):
         out_buckets.append(
             {
                 "bucket": idx,
@@ -283,7 +420,7 @@ def _place_hot_key(k: KeyLoad, states: dict[str, _ShardState]) -> dict:
         "replicated_side": replicated_side,
         "replicated_rows": m,
         "partitioned_side": partitioned_side,
-        "partitioned_rows": M,
+        "partitioned_rows": placement.M,
         "bucket_count": len(out_buckets),
         "buckets": out_buckets,
     }
